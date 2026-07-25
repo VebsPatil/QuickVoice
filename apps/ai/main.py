@@ -39,6 +39,7 @@ from handlers.voice_catalog import load_voice_catalog
 from handlers.voice_config_resolution import resolve_voice_config
 from handlers.voice_provider_adapters import ProviderAdapterError, build_voice_provider_adapters
 from handlers.voice_worker_metadata import is_voice_session_metadata, parse_voice_session_metadata
+from handlers.langfuse_handler import create_call_trace, record_turn
 from utils.logger import logger
 from utils.logger import redact_sensitive
 import asyncio
@@ -267,6 +268,7 @@ class Assistant(Agent):
         config: dict,
         call_context: dict,
         transcript_collector: TranscriptCollector | None = None,
+        langfuse_trace: object | None = None,
     ):
         super().__init__(
             instructions=system_prompt,
@@ -276,6 +278,9 @@ class Assistant(Agent):
         self._call_context = call_context
         self._metadata_collector = CallMetadataCollector(config)
         self._transcript_collector = transcript_collector
+        self._langfuse_trace = langfuse_trace
+        # Timestamp of the last user turn start – used to close the turn span.
+        self._last_user_turn_start: datetime | None = None
 
     def _rag_enabled(self) -> bool:
         return bool(self._config.get("use_rag"))
@@ -332,6 +337,7 @@ class Assistant(Agent):
         logger.info(f"[rag] injected context for agent={agent_id}")
 
     async def transcription_node(self, text, model_settings):
+        turn_start = datetime.now(timezone.utc)
         chunks: list[str] = []
         output = Agent.default.transcription_node(self, text, model_settings)
         if output is None:
@@ -341,10 +347,21 @@ class Assistant(Agent):
             if chunk_text:
                 chunks.append(chunk_text)
             yield chunk
+        turn_end = datetime.now(timezone.utc)
+        full_text = "".join(chunks)
         if self._transcript_collector is not None:
             self._transcript_collector.on_agent_transcription_final(
-                "".join(chunks),
-                datetime.now(timezone.utc),
+                full_text,
+                turn_end,
+            )
+        # Record agent turn as a Langfuse span (no-op when trace is None).
+        if full_text:
+            record_turn(
+                self._langfuse_trace,
+                role="agent",
+                content=full_text,
+                started_at=turn_start,
+                ended_at=turn_end,
             )
 
     @function_tool
@@ -526,11 +543,23 @@ async def entrypoint(ctx: JobContext):
         on_item=live_transcript_publisher.publish_transcript
     ).attach(session)
     system_prompt = build_agent_instructions(config)
+
+    # Open a Langfuse trace for this call (no-op if credentials are absent).
+    langfuse_trace = create_call_trace(
+        call_id=call_context.get("call_id", ctx.room.name),
+        agent_id=config.get("agent_id") or call_context.get("agent_id") or "",
+        organization_id=config.get("organization_id") or "",
+        system_prompt=system_prompt,
+        call_context=call_context,
+        started_at=call_start_time,
+    )
+
     agent = Assistant(
         system_prompt=system_prompt,
         config=config,
         call_context=call_context,
         transcript_collector=transcript_collector,
+        langfuse_trace=langfuse_trace,
     )
 
     @ctx.room.on("data_received")
@@ -589,12 +618,37 @@ async def entrypoint(ctx: JobContext):
     recording_path = build_recording_path(recording_id) if recording_id else None
     shutdown_started = False
 
+    # Wrap the TranscriptCollector's on_item callback so user turns are also
+    # recorded as Langfuse spans in near-real-time.
+    _original_on_item = transcript_collector._on_item
+
+    def _on_transcript_item_with_langfuse(item: dict) -> None:
+        if _original_on_item is not None:
+            try:
+                _original_on_item(dict(item))
+            except Exception:
+                pass
+        if item.get("role") == "user" and item.get("content"):
+            turn_time = item.get("time") or datetime.now(timezone.utc)
+            if not isinstance(turn_time, datetime):
+                turn_time = datetime.now(timezone.utc)
+            record_turn(
+                langfuse_trace,
+                role="user",
+                content=item["content"],
+                started_at=turn_time,
+                ended_at=turn_time,
+            )
+
+    transcript_collector._on_item = _on_transcript_item_with_langfuse
+
     call_finalizer = CallFinalizer(
         config=config,
         call_context=call_context,
         started_at=call_start_time,
         recording_path=recording_path,
         transcript_reader=transcript_collector.read,
+        langfuse_trace=langfuse_trace,
     )
     shutdown_reason = "session_shutdown"
 

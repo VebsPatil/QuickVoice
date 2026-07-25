@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from handlers.calllog_handler import build_call_log_payload, post_call_log_with_retry
+from handlers.langfuse_handler import flush_langfuse, submit_scores
 from utils.logger import logger, redact_sensitive
 
 
@@ -17,6 +18,7 @@ class CallFinalizer:
         recording_path: str | None,
         transcript_reader: Callable[[], list[dict[str, Any]]],
         post_call_log: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
+        langfuse_trace: Any | None = None,
     ):
         self._config = config
         self._call_context = call_context
@@ -24,6 +26,7 @@ class CallFinalizer:
         self._recording_path = recording_path
         self._transcript_reader = transcript_reader
         self._post_call_log = post_call_log or post_call_log_with_retry
+        self._langfuse_trace = langfuse_trace
         self._lock = asyncio.Lock()
         self._completed = False
 
@@ -52,3 +55,19 @@ class CallFinalizer:
                 payload["metadata"]["retentionDays"] = self._config.get("retention_days")
             await self._post_call_log(payload)
             logger.info("[CALL_LOG] finalized call {}", redact_sensitive({"callId": payload["callId"]}))
+
+            # Submit Langfuse evaluation scores and extracted data, then flush
+            # the SDK queue so events are delivered before process exit.
+            # This is a no-op when langfuse_trace is None (Langfuse disabled).
+            try:
+                submit_scores(
+                    self._langfuse_trace,
+                    payload.get("evaluatedData") or [],
+                    extracted_data=payload.get("extractedData") or [],
+                )
+                flush_langfuse()
+            except Exception as langfuse_error:
+                logger.warning(
+                    "[langfuse] error during finalisation submission: {}",
+                    redact_sensitive(str(langfuse_error)),
+                )
